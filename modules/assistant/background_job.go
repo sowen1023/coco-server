@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"time"
 
 	"infini.sh/coco/modules/assistant/rag"
 	"infini.sh/coco/modules/datasource"
@@ -216,6 +217,8 @@ func (h APIHandler) createAssistantMessage(sessionID, assistantID, requestMessag
 		ReplyMessageID: requestMessageID,
 		AssistantID:    assistantID,
 	}
+	now := time.Now()
+	msg.Created = &now
 	msg.ID = util.GetUUID()
 
 	return msg
@@ -261,6 +264,9 @@ func (h APIHandler) processMessageAsync(ctx context.Context, reqMsg *common.Chat
 			}
 		}
 		h.finalizeProcessing(ctx, params.SessionID, replyMsg, sender)
+		// clear the inflight message task
+		taskID := getReplyMessageTaskID(params.SessionID, reqMsg.ID)
+		inflightMessages.Delete(taskID)
 	}()
 
 	reqMsg.Details = make([]common.ProcessingDetails, 0)
@@ -856,6 +862,7 @@ func (h APIHandler) generateFinalResponse(taskCtx context.Context, reqMsg, reply
 
 	echoMsg := common.NewMessageChunk(params.SessionID, replyMsg.ID, common.MessageTypeAssistant, reqMsg.ID, common.Response, string(""), 0)
 	_ = sender.SendMessage(echoMsg)
+	replyMsg.Message += echoMsg.MessageChunk
 
 	// Prepare the system message
 	content := []llms.MessageContent{
@@ -865,6 +872,20 @@ func (h APIHandler) generateFinalResponse(taskCtx context.Context, reqMsg, reply
 	//response
 	reasoningBuffer := strings.Builder{}
 	messageBuffer := strings.Builder{}
+	// note: we use defer to ensure that the response message is saved after processing
+	// even if user cancels the task or if an error occurs
+	defer func() {
+		//save response message to system
+		if messageBuffer.Len() > 0 {
+			replyMsg.Message = messageBuffer.String()
+		} else {
+			log.Warnf("seems empty reply for query:", replyMsg)
+		}
+		if reasoningBuffer.Len() > 0 {
+			detail := common.ProcessingDetails{Order: 50, Type: common.Think, Description: reasoningBuffer.String()}
+			replyMsg.Details = append(replyMsg.Details, detail)
+		}
+	}()
 	chunkSeq := 0
 	var err error
 	if params.answeringProvider == nil {
@@ -990,19 +1011,6 @@ func (h APIHandler) generateFinalResponse(taskCtx context.Context, reqMsg, reply
 
 	chunkSeq += 1
 
-	{
-		if reasoningBuffer.Len() > 0 {
-			detail := common.ProcessingDetails{Order: 50, Type: common.Think, Description: reasoningBuffer.String()}
-			replyMsg.Details = append(replyMsg.Details, detail)
-		}
-	}
-
-	//save response message to system
-	if messageBuffer.Len() > 0 {
-		replyMsg.Message = messageBuffer.String()
-	} else {
-		log.Warnf("seems empty reply for query:", replyMsg)
-	}
 	return nil
 }
 
